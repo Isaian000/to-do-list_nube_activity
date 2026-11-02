@@ -1,0 +1,96 @@
+name: Deploy
+
+# despliega el zip de un release en la ec2 y reinicia la app
+# se llama desde release.yml, al publicar un release o a mano
+on:
+  release:
+    types: [published]
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag del release a desplegar (ej. v1.0.0)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.event.release.tag_name }}
+      EC2_HOST: ${{ secrets.EC2_HOST }}
+      APP_PORT: 8000
+    steps:
+      - name: Validar datos
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag inválido: '$TAG'. Debe ser v#.#.#"; exit 1
+          fi
+          if [ -z "$EC2_HOST" ]; then
+            echo "::error::Falta el secret EC2_HOST con la IP de la instancia"; exit 1
+          fi
+
+      - name: Descargar artefacto del release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          if gh release download "$TAG" --repo "$REPO" --pattern "*.zip" --output release.zip; then
+            exit 0
+          fi
+          # sin zip adjunto: usa el zip de github y quita la carpeta raiz
+          gh release download "$TAG" --repo "$REPO" --archive zip --output source.zip
+          unzip -q source.zip -d source
+          (cd source/*/ && zip -qr "$GITHUB_WORKSPACE/release.zip" .)
+
+      - name: Configurar SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+
+      - name: Copiar y reiniciar en la EC2
+        run: |
+          SSH_OPTS="-i $HOME/.ssh/id_deploy -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20"
+          scp $SSH_OPTS release.zip "ec2-user@${EC2_HOST}:/tmp/release.zip"
+          ssh $SSH_OPTS "ec2-user@${EC2_HOST}" bash -s -- "$TAG" <<'EOF'
+          set -euo pipefail
+          TAG="$1"
+          BASE=/opt/to-do-list
+          DEST="$BASE/releases/$TAG"
+
+          rm -rf "$DEST" && mkdir -p "$DEST"
+          unzip -q /tmp/release.zip -d "$DEST"
+          rm /tmp/release.zip
+          "$BASE/venv/bin/pip" install -q -r "$DEST/app/requirements.txt"
+
+          ln -sfn "$DEST" "$BASE/current"
+          sudo sed -i "s/^APP_VERSION=.*/APP_VERSION=$TAG/" /etc/to-do-list.env
+          sudo systemctl restart to-do-list
+          echo "Desplegado $TAG"
+          EOF
+
+      - name: Verificar /version
+        run: |
+          for i in $(seq 1 20); do
+            VERSION=$(curl -fsS "http://${EC2_HOST}:${APP_PORT}/version" | jq -r .version || true)
+            if [ "$VERSION" = "$TAG" ]; then
+              echo "OK: /version responde $VERSION"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::/version responde '$VERSION', se esperaba '$TAG'"
+          exit 1

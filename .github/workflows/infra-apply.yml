@@ -1,0 +1,93 @@
+name: Infra - apply
+
+# manual: actions > infra - apply > run workflow
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_SESSION_TOKEN: ${{ secrets.AWS_SESSION_TOKEN }}
+  TF_VAR_region: us-east-1
+  TF_VAR_public_key: ${{ secrets.SSH_PUBLIC_KEY }}
+  TF_VAR_repo_url: https://github.com/${{ github.repository }}.git
+  TF_VAR_repo_branch: ${{ github.event.repository.default_branch }}
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+          terraform_wrapper: false
+
+      # crea el bucket del tfstate si el sandbox es nuevo
+      - name: Crear bucket del tfstate si no existe
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          BUCKET="to-do-list-tfstate-${ACCOUNT_ID}"
+          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            if [ "$AWS_REGION" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "$BUCKET"
+            else
+              aws s3api create-bucket --bucket "$BUCKET" \
+                --create-bucket-configuration LocationConstraint="$AWS_REGION"
+            fi
+            aws s3api put-bucket-versioning --bucket "$BUCKET" \
+              --versioning-configuration Status=Enabled
+            aws s3api put-public-access-block --bucket "$BUCKET" \
+              --public-access-block-configuration \
+              BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+          fi
+          echo "TF_STATE_BUCKET=$BUCKET" >> "$GITHUB_ENV"
+
+      - name: terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=to-do-list/terraform.tfstate" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="encrypt=true" \
+            -backend-config="use_lockfile=true"
+
+      - name: terraform apply
+        run: terraform apply -input=false -auto-approve
+
+      - name: Resumen
+        run: |
+          IP=$(terraform output -raw public_ip)
+          echo "EC2_IP=$IP" >> "$GITHUB_ENV"
+          {
+            echo "## Infraestructura lista"
+            echo ""
+            echo "- IP de la EC2: \`$IP\`"
+            echo "- API: $(terraform output -raw tasks_url)"
+            echo ""
+            echo "La app tarda un par de minutos más en arrancar (user_data)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # github_token no escribe secrets, se usa GH_PAT si existe
+      - name: Guardar IP en el secret EC2_HOST
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::No hay GH_PAT. Copia la IP $EC2_IP al secret EC2_HOST manualmente."
+            exit 0
+          fi
+          gh secret set EC2_HOST --repo "${{ github.repository }}" --body "$EC2_IP"
+          echo "Secret EC2_HOST actualizado a $EC2_IP"

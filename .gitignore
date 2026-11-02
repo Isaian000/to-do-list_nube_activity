@@ -1,0 +1,15 @@
+# terraform, el estado tiene datos sensibles
+*.tfstate
+*.tfstate.*
+.terraform/
+*.tfvars
+crash.log
+
+# llaves
+*.pem
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
